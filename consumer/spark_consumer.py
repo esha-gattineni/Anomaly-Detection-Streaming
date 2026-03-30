@@ -1,14 +1,23 @@
 import json
 import os
+import sys
+
+from consumer.schema_validator import validate_event
+
+# Add project root to path so model module can be found
+sys.path.append('..')
+
+# PySpark imports
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import col, from_json, udf
 from pyspark.sql.types import (
     StructType, StructField,
     StringType, FloatType, BooleanType
 )
-from schema_validator import validate_event
 
-# ── 1. Define the expected schema of each event ───────────────
+# Anomaly scorer (must come after sys.path.append)
+import model.anomaly_scorer
+# ── 1. Expected schema of each event ───────────────
 EVENT_SCHEMA = StructType([
     StructField("timestamp",    StringType(),  True),
     StructField("host",         StringType(),  True),
@@ -19,7 +28,7 @@ EVENT_SCHEMA = StructType([
     StructField("is_anomaly",   BooleanType(), True),
 ])
 
-# ── 2. Create Spark Session ───────────────────────────────────
+# ── 2.Spark Session ───────────────────────────────────
 spark = SparkSession.builder \
     .appName("TelemetryAnomalyDetection") \
     .config(
@@ -41,7 +50,7 @@ spark = SparkSession.builder \
 
 spark.sparkContext.setLogLevel("WARN")  # reduces noisy logs
 
-# ── 3. Read stream from Kafka ─────────────────────────────────
+# ── 3. Reading stream from Kafka ─────────────────────────────────
 raw_stream = spark.readStream \
     .format("kafka") \
     .option("kafka.bootstrap.servers", "localhost:9092") \
@@ -49,7 +58,7 @@ raw_stream = spark.readStream \
     .option("startingOffsets", "latest") \
     .load()
 
-# ── 4. Decode bytes → JSON string → structured columns ────────
+# ── 4. Decoding bytes → JSON string → structured columns ────────
 parsed_stream = raw_stream \
     .selectExpr("CAST(value AS STRING) as json_str") \
     .select(from_json(col("json_str"), EVENT_SCHEMA).alias("data")) \
@@ -89,11 +98,21 @@ validated_stream = parsed_stream.withColumn(
 clean_stream = validated_stream.filter(col("is_valid") == True)
 bad_stream   = validated_stream.filter(col("is_valid") == False)
 
-# ── 7. Output — print clean events to console ─────────────────
+# ── 7. Processing each batch with anomaly scoring───────────
+def process_batch(df, epoch_id):
+    """Called by Spark for each micro-batch."""
+    rows = df.collect()
+    for row in rows:
+        event = row.asDict()
+        scored = model.anomaly_scorer.score_event(event)
+
+        status = "🚨 FLAGGED" if scored['is_flagged'] else "✅ normal "
+        print(f"{status} | {scored['host']} | "
+              f"Score: {scored['anomaly_score']:.4f} | "
+              f"CPU: {scored['cpu_usage']}%")
+
 clean_query = clean_stream.writeStream \
-    .outputMode("append") \
-    .format("console") \
-    .option("truncate", False) \
+    .foreachBatch(process_batch) \
     .trigger(processingTime="5 seconds") \
     .start()
 
@@ -113,5 +132,5 @@ print("   Clean events → console")
 print("   Bad events   → ../quarantine/")
 print("   Press Ctrl+C to stop.\n")
 
-# Keep the job running until manually stopped
+
 spark.streams.awaitAnyTermination()
